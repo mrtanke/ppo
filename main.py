@@ -5,7 +5,7 @@ import numpy as np
 import argparse
 
 from models import PolicyValueNet, ContinuousPolicyValueNet
-from utils import compute_gae, evaluate_cartpole, save_stats, evaluate_pendulum
+from utils import compute_gae, evaluate_env_discrete, save_stats, evaluate_env_continuous
 from ppo_agent import ppo_update, ppo_update_continuous, collect_trajectories, collect_trajectories_continuous
 
 DEFAULT_CONFIG = {
@@ -83,7 +83,7 @@ def train_ppo_discrete(env_id: str, total_timesteps: int = 50_000):
         ppo_update(policy, optimizer, data, ppo_hyperparams)
 
         # Step 4: log progress
-        eval_rewards = evaluate_cartpole(eval_env, policy, device)
+        eval_rewards = evaluate_env_discrete(eval_env, policy, device)
         timesteps_history.append(timesteps_collected)
         rewards_history.append(eval_rewards)
         print(f"Timesteps: {timesteps_collected}, Eval Reward: {eval_rewards:.2f}")
@@ -154,7 +154,7 @@ def train_ppo_continuous(env_id: str, total_timesteps: int = 200_000):
         ppo_update_continuous(policy, optimizer, data, ppo_hyperparams)
 
         # Step 4: log progress
-        eval_rewards = evaluate_pendulum(eval_env, policy, device)
+        eval_rewards = evaluate_env_continuous(eval_env, policy, device)
         timesteps_history.append(timesteps_collected)
         rewards_history.append(eval_rewards)
         print(f"Timesteps: {timesteps_collected}, Eval Reward: {eval_rewards:.2f}")
@@ -164,7 +164,7 @@ def train_ppo_continuous(env_id: str, total_timesteps: int = 200_000):
 
     train_env.close()
     eval_env.close()
-
+    
 
 
 if __name__ == "__main__":

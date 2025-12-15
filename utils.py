@@ -35,7 +35,7 @@ def compute_gae(rewards, value, dones, gamma, gae_lambda, last_value=None):
     returns = advantages + value
     return advantages, returns
 
-def evaluate_cartpole(env, policy, device, num_episodes=3, deterministic=False):
+def evaluate_env_discrete(env, policy, device, num_episodes=3, deterministic=False):
     """Backwards-compatible evaluator (despite the name, works for any discrete-action env)."""
     total = 0.0
     for _ in range(num_episodes):
@@ -62,7 +62,7 @@ def save_stats(path, timesteps, rewards):
         rewards=np.array(rewards),
     )
 
-def evaluate_pendulum(env, policy, device, num_episodes=5):
+def evaluate_env_continuous(env, policy, device, num_episodes=5, max_steps=1000):
     total = 0.0
     action_low = env.action_space.low
     action_high = env.action_space.high
@@ -71,7 +71,8 @@ def evaluate_pendulum(env, policy, device, num_episodes=5):
         obs, info = env.reset()
         done = False
         ep_reward = 0.0
-        while not done:
+        steps = 0
+        while not done and steps < max_steps:
             obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
 
             with torch.no_grad():
@@ -86,4 +87,5 @@ def evaluate_pendulum(env, policy, device, num_episodes=5):
             done = terminated or truncated
             ep_reward += reward
         total += ep_reward
+
     return total / num_episodes
