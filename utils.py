@@ -1,6 +1,8 @@
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
+from pathlib import Path
+from typing import Optional
 
 def compute_gae(rewards, value, dones, gamma, gae_lambda, last_value=None):
     """
@@ -64,6 +66,7 @@ def save_stats(path, timesteps, rewards):
 
 def evaluate_env_continuous(env, policy, device, num_episodes=5, max_steps=1000, obs_normalizer=None):
     total = 0.0
+    forward_avgs = []
     action_low = env.action_space.low
     action_high = env.action_space.high
 
@@ -71,6 +74,7 @@ def evaluate_env_continuous(env, policy, device, num_episodes=5, max_steps=1000,
         obs, info = env.reset()
         done = False
         ep_reward = 0.0
+        ep_forward = 0.0
         steps = 0
         while not done and steps < max_steps:
             if obs_normalizer is not None and getattr(obs_normalizer, "count", 0) > 0:
@@ -90,10 +94,14 @@ def evaluate_env_continuous(env, policy, device, num_episodes=5, max_steps=1000,
             obs, reward, terminated, truncated, info = env.step(action_np)
             done = terminated or truncated
             ep_reward += reward
+            ep_forward += info.get("x_velocity", info.get("reward_forward", 0.0))
             steps += 1
         total += ep_reward
+        if steps > 0:
+            forward_avgs.append(ep_forward / steps)
 
-    return total / num_episodes
+    avg_forward = float(np.mean(forward_avgs)) if forward_avgs else 0.0
+    return total / num_episodes, avg_forward
 
 class ObsNormalizer:
     def __init__(self, obs_dim, eps=1e-8):
@@ -199,3 +207,22 @@ class RewardScaler:
             self.reset()
 
         return scaled
+
+def save_policy_checkpoint(policy: torch.nn.Module,
+                           save_path: Path,
+                           env_id: str,
+                           obs_normalizer: Optional[ObsNormalizer] = None) -> None:
+    save_path = Path(save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint = {
+        "policy_state_dict": policy.state_dict(),
+        "env_id": env_id,
+    }
+    if obs_normalizer is not None:
+        checkpoint["obs_normalizer"] = {
+            "mean": obs_normalizer.mean,
+            "var": obs_normalizer.var,
+            "count": obs_normalizer.count,
+        }
+    torch.save(checkpoint, save_path)
+    print(f"Saved policy checkpoint to {save_path}")

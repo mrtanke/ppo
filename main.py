@@ -3,6 +3,7 @@ import torch
 import torch.optim as optim
 import numpy as np
 import argparse
+from pathlib import Path
 from typing import Optional
 
 from models import PolicyValueNet, ContinuousPolicyValueNet
@@ -13,7 +14,9 @@ from utils import (
     evaluate_env_continuous,
     ObsNormalizer,
     RewardScaler,
+    save_policy_checkpoint,
 )
+from wrappers import WalkerForwardRewardWrapper
 from ppo_agent import ppo_update, ppo_update_continuous, collect_trajectories, collect_trajectories_continuous
 
 DEFAULT_CONFIG = {
@@ -22,16 +25,16 @@ DEFAULT_CONFIG = {
     "Pendulum-v1": dict(total_timesteps=2_000_000, lr=3e-4, num_steps=2048,
                          ppo=dict(ent_coef=0.005, train_epochs=6)),
     "Walker2d-v5": dict(
-        total_timesteps=1_000_000,
-        lr=5e-5,
+        total_timesteps=2_000_000,
+        lr=3e-4,
         num_steps=4096,
         use_obs_norm=True,
         use_reward_norm=True,
         ppo=dict(
             batch_size=256,
-            clip_range=0.1,
+            clip_range=0.2,
             train_epochs=10,
-            ent_coef=0.0,
+            ent_coef=0.01,
             target_kl=0.02,
             vf_clip_range=1.0,
         ),
@@ -47,18 +50,34 @@ def parse_args():
     parser.add_argument("--train_epochs", type=int, default=None, help="Number of training epochs per update")
     parser.add_argument("--use_obs_norm", action="store_true", help="Enable observation normalization (continuous envs only)")
     parser.add_argument("--use_reward_norm", action="store_true", help="Enable reward normalization (continuous envs only)")
+    parser.add_argument("--save_model_path", type=str, default=None,
+                        help="Where to save the trained policy (defaults to logs/<env>_policy.pt for Walker2d)")
     return parser.parse_args()
+
+
+
+
+def make_env(env_id: str, render_mode: Optional[str] = None):
+    env_kwargs = {}
+    if render_mode is not None:
+        env_kwargs["render_mode"] = render_mode
+    env = gym.make(env_id, **env_kwargs)
+    if env_id.startswith("Walker2d"):
+        env = WalkerForwardRewardWrapper(env)
+    return env
+
 
 def train_ppo_discrete(env_id: str, total_timesteps: int = 50_000,
                        lr_override: Optional[float] = None,
-                       train_epochs_override: Optional[int] = None):
+                       train_epochs_override: Optional[int] = None,
+                       save_model_path: Optional[str] = None):
     cfg = DEFAULT_CONFIG.get(env_id, {})
     lr = lr_override if lr_override is not None else cfg.get("lr", 3e-4)
     num_steps_per_rollout = cfg.get("num_steps", 2048)
     total_timesteps = cfg.get("total_timesteps", total_timesteps)
 
-    train_env = gym.make(env_id)
-    eval_env = gym.make(env_id)
+    train_env = make_env(env_id)
+    eval_env = make_env(env_id)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     obs_dim = train_env.observation_space.shape[0]
@@ -123,6 +142,9 @@ def train_ppo_discrete(env_id: str, total_timesteps: int = 50_000,
     # Save training statistics
     save_stats(f"{env_id}_training_stats.npz", timesteps_history, rewards_history)
 
+    if save_model_path:
+        save_policy_checkpoint(policy, Path(save_model_path), env_id)
+
     train_env.close()
     eval_env.close()
 
@@ -131,7 +153,8 @@ def train_ppo_continuous(env_id: str, total_timesteps: int = 200_000,
                          lr_override: Optional[float] = None,
                          train_epochs_override: Optional[int] = None,
                          use_obs_norm: bool = False,
-                         use_reward_norm: bool = False):
+                         use_reward_norm: bool = False,
+                         save_model_path: Optional[str] = None):
     cfg = DEFAULT_CONFIG.get(env_id, {})
     lr = lr_override if lr_override is not None else cfg.get("lr", 3e-4)
     num_steps_per_rollout = cfg.get("num_steps", 2048)
@@ -139,8 +162,8 @@ def train_ppo_continuous(env_id: str, total_timesteps: int = 200_000,
     use_obs_norm = cfg.get("use_obs_norm", False) or use_obs_norm
     use_reward_norm = cfg.get("use_reward_norm", False) or use_reward_norm
 
-    train_env = gym.make(env_id)
-    eval_env = gym.make(env_id)
+    train_env = make_env(env_id)
+    eval_env = make_env(env_id)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     obs_dim = train_env.observation_space.shape[0]
@@ -176,6 +199,11 @@ def train_ppo_continuous(env_id: str, total_timesteps: int = 200_000,
     reward_scaler = RewardScaler(gamma=float(ppo_hyperparams["gamma"])) if use_reward_norm else None
 
     timesteps_collected = 0
+    auto_save_path: Optional[Path] = None
+    if save_model_path is not None:
+        auto_save_path = Path(save_model_path)
+    elif env_id.startswith("Walker2d"):
+        auto_save_path = Path("logs") / f"{env_id}_policy.pt"
 
     # history for logging
     timesteps_history = []
@@ -218,7 +246,7 @@ def train_ppo_continuous(env_id: str, total_timesteps: int = 200_000,
         ppo_update_continuous(policy, optimizer, data, ppo_hyperparams)
 
         # Step 4: log progress
-        eval_rewards = evaluate_env_continuous(
+        eval_rewards, eval_forward = evaluate_env_continuous(
             eval_env,
             policy,
             device,
@@ -226,10 +254,21 @@ def train_ppo_continuous(env_id: str, total_timesteps: int = 200_000,
         )
         timesteps_history.append(timesteps_collected)
         rewards_history.append(eval_rewards)
-        print(f"Timesteps: {timesteps_collected}, Eval Reward: {eval_rewards:.2f}")
+        print(
+            f"Timesteps: {timesteps_collected}, Eval Reward: {eval_rewards:.2f}, "
+            f"Avg Forward Vel: {eval_forward:.2f}"
+        )
 
     # Save training statistics
     save_stats(f"{env_id}_training_stats.npz", timesteps_history, rewards_history)
+
+    if auto_save_path is not None:
+        save_policy_checkpoint(
+            policy,
+            auto_save_path,
+            env_id,
+            obs_normalizer=obs_normalizer,
+        )
 
     train_env.close()
     eval_env.close()
@@ -249,6 +288,7 @@ if __name__ == "__main__":
                 total_timesteps=args.total_timesteps,
                 lr_override=args.lr,
                 train_epochs_override=args.train_epochs,
+                save_model_path=args.save_model_path,
             )
         else:
             train_ppo_continuous(
@@ -258,6 +298,7 @@ if __name__ == "__main__":
                 train_epochs_override=args.train_epochs,
                 use_obs_norm=args.use_obs_norm,
                 use_reward_norm=args.use_reward_norm,
+                save_model_path=args.save_model_path,
             )
         env.close()
     
@@ -267,6 +308,7 @@ if __name__ == "__main__":
             total_timesteps=args.total_timesteps,
             lr_override=args.lr,
             train_epochs_override=args.train_epochs,
+            save_model_path=args.save_model_path,
         )
     elif args.mode == "continuous":
         train_ppo_continuous(
@@ -276,6 +318,7 @@ if __name__ == "__main__":
             train_epochs_override=args.train_epochs,
             use_obs_norm=args.use_obs_norm,
             use_reward_norm=args.use_reward_norm,
+            save_model_path=args.save_model_path,
         )
     else:
         raise ValueError(f"Unknown mode: {args.mode}")
