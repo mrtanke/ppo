@@ -12,12 +12,18 @@ def ppo_update(policy, optimizer, data, ppo_hyperparams):
     advantages = data["advantages"]
     returns = data["returns"]
     old_log_probs = data["log_probs"]
+    old_values = data["values"]
 
     batch_size = ppo_hyperparams["batch_size"]
     clip_range = ppo_hyperparams["clip_range"]
     train_epochs = ppo_hyperparams["train_epochs"]
+    target_kl = ppo_hyperparams.get("target_kl", None)
+    vf_clip_range = ppo_hyperparams.get("vf_clip_range", None)
 
     N = obs.shape[0]
+
+    early_stop = False
+    last_approx_kl = torch.tensor(0.0, device=obs.device)
 
     for epoch in range(train_epochs):
         perm = torch.randperm(N) # shuffle indices, dimension: [N]
@@ -30,6 +36,7 @@ def ppo_update(policy, optimizer, data, ppo_hyperparams):
             mb_old_log_probs = old_log_probs[mb_idx]
             mb_advantages = advantages[mb_idx]
             mb_returns = returns[mb_idx]
+            mb_old_values = old_values[mb_idx]
 
             # forward pass
             logits, values = policy(mb_obs) # logits: [batch_size, act_dim], values: [batch_size]
@@ -45,7 +52,18 @@ def ppo_update(policy, optimizer, data, ppo_hyperparams):
             policy_loss = -torch.min(unclipped, clipped).mean()
 
             # value loss (MSE)
-            value_loss = (mb_returns - values).pow(2).mean()
+            if vf_clip_range is not None:
+                values_clipped = mb_old_values + torch.clamp(
+                    values - mb_old_values,
+                    -vf_clip_range,
+                    vf_clip_range,
+                )
+                value_loss = torch.max(
+                    (values - mb_returns).pow(2),
+                    (values_clipped - mb_returns).pow(2),
+                ).mean()
+            else:
+                value_loss = (mb_returns - values).pow(2).mean()
 
             # entropy bonus (optional)
             entropy = dist.entropy().mean()
@@ -62,6 +80,13 @@ def ppo_update(policy, optimizer, data, ppo_hyperparams):
                 torch.nn.utils.clip_grad_norm_(policy.parameters(), max_grad_norm)
             optimizer.step()
 
+            last_approx_kl = (mb_old_log_probs - new_log_probs).mean()
+            if target_kl is not None and last_approx_kl > 1.5 * target_kl:
+                early_stop = True
+                break
+        if early_stop:
+            break
+
 
 def ppo_update_continuous(policy, optimizer, data, ppo_params):
     obs = data["obs"]
@@ -69,13 +94,19 @@ def ppo_update_continuous(policy, optimizer, data, ppo_params):
     advantages = data["advantages"]
     returns = data["returns"]
     old_log_probs = data["log_probs"]
+    old_values = data["values"]
 
     batch_size = ppo_params["batch_size"]
     clip_range = ppo_params["clip_range"]
     train_epochs = ppo_params["train_epochs"]
+    target_kl = ppo_params.get("target_kl", None)
+    vf_clip_range = ppo_params.get("vf_clip_range", None)
 
     N = obs.shape[0]
     idxs = torch.arange(N)
+
+    early_stop = False
+    last_approx_kl = torch.tensor(0.0, device=obs.device)
 
     for epoch in range(train_epochs):
         perm = idxs[torch.randperm(N)]
@@ -88,11 +119,13 @@ def ppo_update_continuous(policy, optimizer, data, ppo_params):
             mb_old_log_probs = old_log_probs[mb_idx]
             mb_advantages = advantages[mb_idx]
             mb_returns = returns[mb_idx]
+            mb_old_values = old_values[mb_idx]
 
             mean, log_std, values = policy.forward(mb_obs)
             std = torch.exp(log_std)
             dist = torch.distributions.Normal(mean, std) # mean dimensions: [batch_size, act_dim], std dimensions: [act_dim]
             new_log_probs = dist.log_prob(mb_actions).sum(-1)
+            value_preds = values
 
             ratio = torch.exp(new_log_probs - mb_old_log_probs)
 
@@ -102,7 +135,18 @@ def ppo_update_continuous(policy, optimizer, data, ppo_params):
             policy_loss = -torch.min(unclipped, clipped).mean()
 
             # value loss (MSE)
-            value_loss = (mb_returns - values).pow(2).mean()
+            if vf_clip_range is not None:
+                values_clipped = mb_old_values + torch.clamp(
+                    value_preds - mb_old_values,
+                    -vf_clip_range,
+                    vf_clip_range,
+                )
+                value_loss = torch.max(
+                    (value_preds - mb_returns).pow(2),
+                    (values_clipped - mb_returns).pow(2),
+                ).mean()
+            else:
+                value_loss = (value_preds - mb_returns).pow(2).mean()
 
             # entropy bonus (optional)
             entropy = dist.entropy().sum(-1).mean()
@@ -114,7 +158,17 @@ def ppo_update_continuous(policy, optimizer, data, ppo_params):
 
             optimizer.zero_grad()
             loss.backward()
+            max_grad_norm = ppo_params.get("max_grad_norm", None)
+            if max_grad_norm is not None:
+                torch.nn.utils.clip_grad_norm_(policy.parameters(), max_grad_norm)
             optimizer.step()
+
+            last_approx_kl = (mb_old_log_probs - new_log_probs).mean()
+            if target_kl is not None and last_approx_kl > 1.5 * target_kl:
+                early_stop = True
+                break
+        if early_stop:
+            break
 
 
 def collect_trajectories(env, policy, num_steps, device):
@@ -176,7 +230,8 @@ def collect_trajectories(env, policy, num_steps, device):
     return data
 
 
-def collect_trajectories_continuous(env, policy, num_steps, device):
+def collect_trajectories_continuous(env, policy, num_steps, device,
+                                   obs_normalizer=None, reward_scaler=None):
     """
     Collect trajectories by interacting with the environment using the current policy.
     Similar to collect_trajectories but for continuous action spaces.
@@ -190,7 +245,7 @@ def collect_trajectories_continuous(env, policy, num_steps, device):
 
     :return: dictionary containing collected data
     """
-    obs_list = []
+    obs_list = []  # raw observations for updating normalizer
     actions_list = []
     rewards_list = []
     done_list = []
@@ -198,21 +253,27 @@ def collect_trajectories_continuous(env, policy, num_steps, device):
     log_probs_list = []
 
     obs, info = env.reset()
+    if reward_scaler is not None:
+        reward_scaler.reset()
     action_low = env.action_space.low
     action_high = env.action_space.high
 
     for _ in range(num_steps):
-        obs_tensor = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0) # [1, obs_dim]
+        obs_input = obs_normalizer.normalize(obs) if obs_normalizer is not None and obs_normalizer.count > 0 else obs
+        obs_tensor = torch.tensor(obs_input, dtype=torch.float32, device=device).unsqueeze(0) # [1, obs_dim]
     
         with torch.no_grad():
             action, log_prob, value, dist = policy.get_action_and_value(obs_tensor)
 
-        action_np = action.cpu().numpy()[0]
+        action_np = action.cpu().numpy()[0].astype(np.float32)
         # Clip action to be within action space bounds
         action_np = np.clip(action_np, action_low, action_high)
 
         next_obs, reward, terminated, truncated, info = env.step(action_np)
         done = terminated or truncated
+
+        if reward_scaler is not None:
+            reward = reward_scaler.normalize(float(reward), done)
 
         obs_list.append(obs)
         actions_list.append(action_np)
@@ -225,16 +286,28 @@ def collect_trajectories_continuous(env, policy, num_steps, device):
         if done:
             obs, info = env.reset()
 
+            if reward_scaler is not None:
+                reward_scaler.reset()
+
+    obs_array = np.asarray(obs_list, dtype=np.float32)
+    if obs_normalizer is not None:
+        obs_normalizer.update(obs_array)
+        norm_obs_array = obs_normalizer.normalize(obs_array)
+    else:
+        norm_obs_array = obs_array
+
+    rewards_array = np.asarray(rewards_list, dtype=np.float32)
     # Bootstrap value for the last observation (needed when the rollout ends mid-episode).
     with torch.no_grad():
-        last_obs_tensor = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+        last_obs_input = obs_normalizer.normalize(obs) if obs_normalizer is not None and obs_normalizer.count > 0 else obs
+        last_obs_tensor = torch.tensor(last_obs_input, dtype=torch.float32, device=device).unsqueeze(0)
         _, _, last_value, _ = policy.get_action_and_value(last_obs_tensor)
         last_value = last_value.squeeze(0)
     
     data = {
-        "obs": torch.as_tensor(np.asarray(obs_list), dtype=torch.float32, device=device),
+        "obs": torch.as_tensor(norm_obs_array, dtype=torch.float32, device=device),
         "actions": torch.as_tensor(np.asarray(actions_list), dtype=torch.float32, device=device),
-        "rewards": torch.as_tensor(np.asarray(rewards_list), dtype=torch.float32, device=device),
+        "rewards": torch.as_tensor(rewards_array, dtype=torch.float32, device=device),
         "dones": torch.as_tensor(np.asarray(done_list), dtype=torch.bool, device=device),
         "values": torch.as_tensor(np.asarray(value_list), dtype=torch.float32, device=device),
         "log_probs": torch.as_tensor(np.asarray(log_probs_list), dtype=torch.float32, device=device),

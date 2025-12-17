@@ -3,15 +3,39 @@ import torch
 import torch.optim as optim
 import numpy as np
 import argparse
+from typing import Optional
 
 from models import PolicyValueNet, ContinuousPolicyValueNet
-from utils import compute_gae, evaluate_env_discrete, save_stats, evaluate_env_continuous
+from utils import (
+    compute_gae,
+    evaluate_env_discrete,
+    save_stats,
+    evaluate_env_continuous,
+    ObsNormalizer,
+    RewardScaler,
+)
 from ppo_agent import ppo_update, ppo_update_continuous, collect_trajectories, collect_trajectories_continuous
 
 DEFAULT_CONFIG = {
     "CartPole-v1": dict(total_timesteps=50_000, lr=3e-4, num_steps=2048),
     "Acrobot-v1": dict(total_timesteps=500_000, lr=1e-4, num_steps=2048),
-    "Pendulum-v1": dict(total_timesteps=2_000_000, lr=3e-4, num_steps=2048),
+    "Pendulum-v1": dict(total_timesteps=2_000_000, lr=3e-4, num_steps=2048,
+                         ppo=dict(ent_coef=0.005, train_epochs=6)),
+    "Walker2d-v5": dict(
+        total_timesteps=1_000_000,
+        lr=5e-5,
+        num_steps=4096,
+        use_obs_norm=True,
+        use_reward_norm=True,
+        ppo=dict(
+            batch_size=256,
+            clip_range=0.1,
+            train_epochs=10,
+            ent_coef=0.0,
+            target_kl=0.02,
+            vf_clip_range=1.0,
+        ),
+    ),
 }
 
 def parse_args():
@@ -19,12 +43,17 @@ def parse_args():
     parser.add_argument("--env_id", type=str, default="CartPole-v1")
     parser.add_argument("--total_timesteps", type=int, default=100_000)
     parser.add_argument("--mode", type=str, default="auto", choices=["discrete", "continuous", "auto"])
+    parser.add_argument("--lr", type=float, default=None, help="Learning rate (overrides default)")
+    parser.add_argument("--train_epochs", type=int, default=None, help="Number of training epochs per update")
+    parser.add_argument("--use_obs_norm", action="store_true", help="Enable observation normalization (continuous envs only)")
+    parser.add_argument("--use_reward_norm", action="store_true", help="Enable reward normalization (continuous envs only)")
     return parser.parse_args()
 
-
-def train_ppo_discrete(env_id: str, total_timesteps: int = 50_000):
+def train_ppo_discrete(env_id: str, total_timesteps: int = 50_000,
+                       lr_override: Optional[float] = None,
+                       train_epochs_override: Optional[int] = None):
     cfg = DEFAULT_CONFIG.get(env_id, {})
-    lr = cfg.get("lr", 3e-4)
+    lr = lr_override if lr_override is not None else cfg.get("lr", 3e-4)
     num_steps_per_rollout = cfg.get("num_steps", 2048)
     total_timesteps = cfg.get("total_timesteps", total_timesteps)
 
@@ -54,6 +83,9 @@ def train_ppo_discrete(env_id: str, total_timesteps: int = 50_000):
         vf_coef=0.5,
         max_grad_norm=0.5,
     )
+    ppo_hyperparams.update(cfg.get("ppo", {}))
+    if train_epochs_override is not None:
+        ppo_hyperparams["train_epochs"] = train_epochs_override
 
     timesteps_collected = 0
 
@@ -95,17 +127,24 @@ def train_ppo_discrete(env_id: str, total_timesteps: int = 50_000):
     eval_env.close()
 
 
-def train_ppo_continuous(env_id: str, total_timesteps: int = 200_000):
+def train_ppo_continuous(env_id: str, total_timesteps: int = 200_000,
+                         lr_override: Optional[float] = None,
+                         train_epochs_override: Optional[int] = None,
+                         use_obs_norm: bool = False,
+                         use_reward_norm: bool = False):
     cfg = DEFAULT_CONFIG.get(env_id, {})
-    lr = cfg.get("lr", 3e-4)
+    lr = lr_override if lr_override is not None else cfg.get("lr", 3e-4)
     num_steps_per_rollout = cfg.get("num_steps", 2048)
     total_timesteps = cfg.get("total_timesteps", total_timesteps)
+    use_obs_norm = cfg.get("use_obs_norm", False) or use_obs_norm
+    use_reward_norm = cfg.get("use_reward_norm", False) or use_reward_norm
 
     train_env = gym.make(env_id)
     eval_env = gym.make(env_id)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     obs_dim = train_env.observation_space.shape[0]
+    obs_normalizer = ObsNormalizer(obs_dim) if use_obs_norm else None
     act_dim = train_env.action_space.shape[0]
 
     policy = ContinuousPolicyValueNet(
@@ -125,6 +164,16 @@ def train_ppo_continuous(env_id: str, total_timesteps: int = 200_000):
         vf_coef=0.5,
         max_grad_norm=0.5,
     )
+    ppo_hyperparams.update(cfg.get("ppo", {}))
+    if train_epochs_override is not None:
+        ppo_hyperparams["train_epochs"] = train_epochs_override
+
+    # SB3-style schedules (linear)
+    initial_lr = lr
+    initial_clip_range = float(ppo_hyperparams.get("clip_range", 0.2))
+
+    # SB3-style reward normalization (based on discounted returns RMS)
+    reward_scaler = RewardScaler(gamma=float(ppo_hyperparams["gamma"])) if use_reward_norm else None
 
     timesteps_collected = 0
 
@@ -133,8 +182,23 @@ def train_ppo_continuous(env_id: str, total_timesteps: int = 200_000):
     rewards_history = []
 
     while timesteps_collected < total_timesteps:
+        # Update schedules (SB3 uses progress_remaining in [1..0])
+        progress_remaining = 1.0 - (timesteps_collected / float(total_timesteps))
+        progress_remaining = float(np.clip(progress_remaining, 0.0, 1.0))
+        lr_now = max(initial_lr * progress_remaining, 1e-6)
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = lr_now
+        ppo_hyperparams["clip_range"] = max(initial_clip_range * progress_remaining, 0.0)
+
         # Step 1: collect trajectories
-        data = collect_trajectories_continuous(train_env, policy, num_steps_per_rollout, device=device)
+        data = collect_trajectories_continuous(
+            train_env,
+            policy,
+            num_steps_per_rollout,
+            device=device,
+            obs_normalizer=obs_normalizer,
+            reward_scaler=reward_scaler,
+        )
         timesteps_collected += num_steps_per_rollout
         
         # Step 2: compute advantages and returns
@@ -154,7 +218,12 @@ def train_ppo_continuous(env_id: str, total_timesteps: int = 200_000):
         ppo_update_continuous(policy, optimizer, data, ppo_hyperparams)
 
         # Step 4: log progress
-        eval_rewards = evaluate_env_continuous(eval_env, policy, device)
+        eval_rewards = evaluate_env_continuous(
+            eval_env,
+            policy,
+            device,
+            obs_normalizer=obs_normalizer,
+        )
         timesteps_history.append(timesteps_collected)
         rewards_history.append(eval_rewards)
         print(f"Timesteps: {timesteps_collected}, Eval Reward: {eval_rewards:.2f}")
@@ -164,7 +233,7 @@ def train_ppo_continuous(env_id: str, total_timesteps: int = 200_000):
 
     train_env.close()
     eval_env.close()
-    
+
 
 
 if __name__ == "__main__":
@@ -175,14 +244,38 @@ if __name__ == "__main__":
         # infer from env
         env = gym.make(args.env_id)
         if isinstance(env.action_space, gym.spaces.Discrete):
-            train_ppo_discrete(env_id=args.env_id, total_timesteps=args.total_timesteps)
+            train_ppo_discrete(
+                env_id=args.env_id,
+                total_timesteps=args.total_timesteps,
+                lr_override=args.lr,
+                train_epochs_override=args.train_epochs,
+            )
         else:
-            train_ppo_continuous(env_id=args.env_id, total_timesteps=args.total_timesteps)
+            train_ppo_continuous(
+                env_id=args.env_id,
+                total_timesteps=args.total_timesteps,
+                lr_override=args.lr,
+                train_epochs_override=args.train_epochs,
+                use_obs_norm=args.use_obs_norm,
+                use_reward_norm=args.use_reward_norm,
+            )
         env.close()
     
     elif args.mode == "discrete":
-        train_ppo_discrete(env_id=args.env_id, total_timesteps=args.total_timesteps)
+        train_ppo_discrete(
+            env_id=args.env_id,
+            total_timesteps=args.total_timesteps,
+            lr_override=args.lr,
+            train_epochs_override=args.train_epochs,
+        )
     elif args.mode == "continuous":
-        train_ppo_continuous(env_id=args.env_id, total_timesteps=args.total_timesteps)
+        train_ppo_continuous(
+            env_id=args.env_id,
+            total_timesteps=args.total_timesteps,
+            lr_override=args.lr,
+            train_epochs_override=args.train_epochs,
+            use_obs_norm=args.use_obs_norm,
+            use_reward_norm=args.use_reward_norm,
+        )
     else:
         raise ValueError(f"Unknown mode: {args.mode}")
