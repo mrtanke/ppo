@@ -16,7 +16,6 @@ from utils import (
     RewardScaler,
     save_policy_checkpoint,
 )
-from wrappers import WalkerForwardRewardWrapper
 from ppo_agent import ppo_update, ppo_update_continuous, collect_trajectories, collect_trajectories_continuous
 
 DEFAULT_CONFIG = {
@@ -57,16 +56,6 @@ def parse_args():
 
 
 
-def make_env(env_id: str, render_mode: Optional[str] = None):
-    env_kwargs = {}
-    if render_mode is not None:
-        env_kwargs["render_mode"] = render_mode
-    env = gym.make(env_id, **env_kwargs)
-    if env_id.startswith("Walker2d"):
-        env = WalkerForwardRewardWrapper(env)
-    return env
-
-
 def train_ppo_discrete(env_id: str, total_timesteps: int = 50_000,
                        lr_override: Optional[float] = None,
                        train_epochs_override: Optional[int] = None,
@@ -76,8 +65,8 @@ def train_ppo_discrete(env_id: str, total_timesteps: int = 50_000,
     num_steps_per_rollout = cfg.get("num_steps", 2048)
     total_timesteps = cfg.get("total_timesteps", total_timesteps)
 
-    train_env = make_env(env_id)
-    eval_env = make_env(env_id)
+    train_env = gym.make(env_id)
+    eval_env = gym.make(env_id)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     obs_dim = train_env.observation_space.shape[0]
@@ -162,8 +151,8 @@ def train_ppo_continuous(env_id: str, total_timesteps: int = 200_000,
     use_obs_norm = cfg.get("use_obs_norm", False) or use_obs_norm
     use_reward_norm = cfg.get("use_reward_norm", False) or use_reward_norm
 
-    train_env = make_env(env_id)
-    eval_env = make_env(env_id)
+    train_env = gym.make(env_id)
+    eval_env = gym.make(env_id)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     obs_dim = train_env.observation_space.shape[0]
@@ -246,7 +235,7 @@ def train_ppo_continuous(env_id: str, total_timesteps: int = 200_000,
         ppo_update_continuous(policy, optimizer, data, ppo_hyperparams)
 
         # Step 4: log progress
-        eval_rewards, eval_forward = evaluate_env_continuous(
+        eval_rewards = evaluate_env_continuous(
             eval_env,
             policy,
             device,
@@ -254,10 +243,7 @@ def train_ppo_continuous(env_id: str, total_timesteps: int = 200_000,
         )
         timesteps_history.append(timesteps_collected)
         rewards_history.append(eval_rewards)
-        print(
-            f"Timesteps: {timesteps_collected}, Eval Reward: {eval_rewards:.2f}, "
-            f"Avg Forward Vel: {eval_forward:.2f}"
-        )
+        print(f"Timesteps: {timesteps_collected}, Eval Reward: {eval_rewards:.2f}")
 
     # Save training statistics
     save_stats(f"{env_id}_training_stats.npz", timesteps_history, rewards_history)

@@ -66,7 +66,6 @@ def save_stats(path, timesteps, rewards):
 
 def evaluate_env_continuous(env, policy, device, num_episodes=5, max_steps=1000, obs_normalizer=None):
     total = 0.0
-    forward_avgs = []
     action_low = env.action_space.low
     action_high = env.action_space.high
 
@@ -74,7 +73,6 @@ def evaluate_env_continuous(env, policy, device, num_episodes=5, max_steps=1000,
         obs, info = env.reset()
         done = False
         ep_reward = 0.0
-        ep_forward = 0.0
         steps = 0
         while not done and steps < max_steps:
             if obs_normalizer is not None and getattr(obs_normalizer, "count", 0) > 0:
@@ -94,14 +92,10 @@ def evaluate_env_continuous(env, policy, device, num_episodes=5, max_steps=1000,
             obs, reward, terminated, truncated, info = env.step(action_np)
             done = terminated or truncated
             ep_reward += reward
-            ep_forward += info.get("x_velocity", info.get("reward_forward", 0.0))
             steps += 1
         total += ep_reward
-        if steps > 0:
-            forward_avgs.append(ep_forward / steps)
 
-    avg_forward = float(np.mean(forward_avgs)) if forward_avgs else 0.0
-    return total / num_episodes, avg_forward
+    return total / num_episodes
 
 class ObsNormalizer:
     def __init__(self, obs_dim, eps=1e-8):
